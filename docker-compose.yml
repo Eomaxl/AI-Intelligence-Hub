@@ -1,0 +1,254 @@
+# Docker Compose configuration for AI Intelligence Hub local development
+# Provides all services needed to run the full system locally.
+#
+# Usage:
+#   docker compose up -d          # Start all services
+#   docker compose logs -f ai-service  # Tail AI service logs
+#   docker compose down -v        # Stop and remove volumes
+#
+# Requirements: 10.6
+
+services:
+  # ---------------------------------------------------------------------
+  #  AI Intelligence Hub Service (Python 3.12 FastAPI + gRPC)
+  # ---------------------------------------------------------------------
+  ai-service:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-intelligence-hub
+    ports:
+      - "8000:8000"    # FastAPI HTTP  (health/readiness)
+      - "50051:50051"  # gRPC
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_URL=postgres+asyncpg://ai_hub:ai_hub@postgres:5432/ai_intelligence_hub
+      - REDIS_URL=redis:/redis:6390/0
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - TORCHSERVE_URL=http://torchserve:8080
+      - EMBEDDING_URL=http://torchserve:8080
+      - BEDROCK_REGION_NAME=us-east-1
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - SERVICE_ENVIRONMENT=development
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - ./ai_intelligence_hub:/app/ai_intelligence_hub:ro
+      - ./alembic:/app/alembic:ro
+      - ./alembic.ini:/app/alembic.ini:ro
+    networks:
+      - ai-hub-network
+
+  # ---------------------------------------------------------------------
+  #  PostgreSQL with pgvector extension
+  # ---------------------------------------------------------------------
+  postgres:
+    image:  pgvector/pgvector:pg16
+    container_name: ai-hub-postgres
+    ports:
+      -"5432:5432"
+    environment:
+      - POSTGRES_USER: ai_hub
+      - POSTGRES_PASSWORD:  ai_hub
+      - POSTGRES_DB:  ai_intelligence_hub
+    volumes:
+      - postgres_data:/var/lib/postgresql/Database
+      - ./scripts/docker/init-db.sql:/docker-entrypoint-initdb.d/01-init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_hub -d ai_intelligence_hub"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - ai-hub-network
+
+  # ---------------------------------------------------------------------
+  #  Redis (Caching, rate limiting, token budget tracking)
+  # ---------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ai-hub-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ai-hub-network
+
+  # ---------------------------------------------------------------------
+  #  TorchServe Sidecar (DistilBERT ticket classifier)
+  # ---------------------------------------------------------------------
+  torchserve:
+    build:
+      context: .
+      dockerfile: Dockerfile.torchserve
+    container_name: ai-hub-torchserve
+    ports:
+      - "8080:8080"   # Inference API
+      - "8081:8081"   # Management API
+      - "8082:8082"   # Metrics API
+    environment:
+      - TS_CONFIG_FILE=/home/model-server/config.properties
+    volumes:
+      - model_store:/home/model-server/model-store
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ai-hub-network
+
+  # ---------------------------------------------------------------------
+  #  Localstack (AWS Service mocking: Bedrock, S3, Cloudwatch)
+  # ---------------------------------------------------------------------
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: ai-hub-localstack
+    ports:
+      - "4566:4566"    # LocalStack edge port (all services)
+    environment:
+      - SERVICES=s3,cloudwatch,logs,bedrock
+      - DEBUG=0
+      - PERSISTENCE=1
+      - AWS_DEFAULT_REGION=us-east-1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/docker/init-localstack.sh:/etc/localstack/init/ready.d/init-localstack.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    networks:
+      - ai-hub-network
+
+  # ---------------------------------------------------------------------
+  #  Redpanda (Kafka - compatible streaming, lightweight for local dev)
+  # ---------------------------------------------------------------------
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.1
+    container_name: ai-hub-redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container
+      - --smp 1
+      - --memory 512M
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"  # Kafka external (host access)
+      - "18082:18082"  # HTTP Proxy
+      - "18081:18081"  # Schema Registry
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'HEALTHY'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    networks:
+      - ai-hub-network
+
+  # ---------------------------------------------------------------------
+  #  Redpanda Console (optional Kafka UI for debugging)
+  # ---------------------------------------------------------------------
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.5.2
+    container_name: ai-hub-redpanda-console
+    ports:
+      - "8888:8080"
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+      - KAFKA_SCHEMAREGISTRY_ENABLED=true
+      - KAFKA_SCHEMAREGISTRY_URLS=http://redpanda:8081
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - ai-hub-network
+
+  # ---------------------------------------------------------------------
+  #  Topic initialization (creates required Kafka topics on startup)
+  # ---------------------------------------------------------------------
+  init-topics:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.1
+    container_name: ai-hub-init-topics
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "Waiting for Redpanda to be ready..."
+        until rpk cluster health --brokers redpanda:9092 | grep -q 'HEALTHY'; do sleep 1; done
+        echo "Creating topics..."
+        rpk topic create enriched-events --brokers redpanda:9092 --partitions 6 --replicas 1
+        rpk topic create enriched-events-dlq --brokers redpanda:9092 --partitions 3 --replicas 1
+        echo "Topics created successfully."
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - ai-hub-network
+
+  # ---------------------------------------------------------------------
+  #  Database migration runner (runs Alembic migrations on startup)
+  # ---------------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: base
+    container_name: ai-hub-migrate
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      - SQLALCHEMY_DATABASE_URL=postgresql://ai_hub:ai_hub@postgres:5432/ai_intelligence_hub
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ai-hub-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  redpanda_data:
+  localstack_data:
+  model_store:
+
+networks:
+  ai-hub-network:
+    driver: bridge

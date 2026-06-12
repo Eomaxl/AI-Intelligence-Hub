@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package intelligence_hub;
+
+import "google/protobuf/timestamp.proto";
+
+service IntelligenceHub {
+    rpc SummarizeAccount(SummarizeAccountRequest) returns (SummarizeAccountResponse);
+    rpc QueryAccount(QueryAccountRequest) returns (QueryAccountResponse);
+    rpc SuggestForTicket(SuggestForTicketRequest) returns (SuggestForTicketResponse);
+}
+
+message SummarizeAccountRequest {
+    int64 account_id = 1;
+    int64 manager_id = 2;
+    google.protobuf.Timestamp since_ts = 3;
+    repeated int64 authorized_account_ids = 4;
+}
+
+message SummarizeAccountResponse {
+    oneof result {
+        AccountSummary summary = 1;
+        ErrorResponse error = 2;
+    }
+}
+
+message AccountSummary {
+    int64 account_id = 1;
+    string narrative = 2;
+    repeated HighPriorityEvent high_priority_events = 3;
+    bool from_cache = 4;
+}
+
+message HighPriorityEvent {
+    string event_id = 1;
+    string event_type = 2;
+    int32 priority_score = 3;
+}
+
+message QueryAccountRequest {
+    int64 manager_id = 1;
+    repeated int64 authorized_account_ids = 2;
+    string query = 3;
+}
+
+message QueryAccountResponse {
+    oneof result {
+        RagAnswer answer = 1;
+        ErrorResponse error = 2;
+    }
+}
+
+message RagAnswer {
+    string text = 1;
+    repeated Citation citations = 2;
+}
+
+message Citation {
+    string source_ref = 1;
+    string source = 2;
+    string doc_type = 3;
+    float similarity_score = 4;
+}
+
+message SuggestForTicketRequest {
+    string ticket_id = 1;
+    repeated int64 authorized_account_ids = 2;
+}
+
+message SuggestForTicketResponse {
+    oneof result {
+        TicketSuggestion suggestion = 1;
+        ErrorResponse error = 2;
+    }
+}
+
+message TicketSuggestion {
+    string ticket_id = 1;
+    Classification classification = 2;
+    repeated SimilarTicket similar_tickets = 3;
+    optional string suggested_action = 4;
+    bool action_generated = 5;
+}
+
+message Classification {
+    string category = 1;
+    string priority = 2;
+    float confidence = 3;
+}
+
+message SimilarTicket {
+    string source_ref = 1;
+    string category = 2;
+    float similarity_score = 3;
+    string resolution_summary = 4;
+}
+
+message ErrorResponse {
+    string code = 1;
+    string message = 2;
+    bool retryable = 3;
+}

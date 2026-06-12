@@ -1,0 +1,75 @@
+# Dockerfile for TorchServe DistilBERT Sidecar
+# Serves the fine-tuned DistilBERT ticket classification model via TorchServe.
+#
+# The model artifact (.mar file) is expected to be mounted or downloaded
+# from S3 at runtime. For local development, a dummy model handler is
+# included to simulate inference responses.
+#
+# Requirements: 12.1, 12.2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1: Build — prepare model artifacts and config
+# ─────────────────────────────────────────────────────────────────────────────
+FROM pytorch/torchserve:0.11.0-cpu AS build
+
+USER root
+
+# Install model archiver and additional dependencies
+RUN pip install --no-cache-dir \
+    torch-model-archiver \
+    transformers \
+    tokenizers
+
+WORKDIR /build
+
+# Copy model handler and configuration
+COPY scripts/docker/torchserve/ ./
+
+# Create model archive for local development (dummy/placeholder model)
+# In production, the .mar file is pulled from S3 with versioned weights.
+RUN mkdir -p /build/model-store && \
+    if [ -f handler.py ]; then \
+        torch-model-archiver \
+            --model-name distilbert-ticket-classifier \
+            --version 1.0 \
+            --handler handler.py \
+            --export-path /build/model-store \
+            --force; \
+    fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2: Runtime — TorchServe with model and config
+# ─────────────────────────────────────────────────────────────────────────────
+FROM pytorch/torchserve:0.11.0-cpu AS runtime
+
+USER root
+
+# Install runtime dependencies for DistilBERT inference
+RUN pip install --no-cache-dir \
+    transformers \
+    tokenizers
+
+# Copy model store from build stage (if .mar was created)
+COPY --from=build /build/model-store /home/model-server/model-store/
+
+# Copy TorchServe configuration
+COPY scripts/docker/torchserve/config.properties /home/model-server/config.properties
+
+# Ensure model-server user owns the files
+RUN chown -R model-server:model-server /home/model-server/
+
+USER model-server
+
+# Expose TorchServe ports
+# 8080 - Inference API
+# 8081 - Management API
+# 8082 - Metrics API
+EXPOSE 8080 8081 8082
+
+# Start TorchServe with the model store
+CMD ["torchserve", \
+     "--start", \
+     "--ncs", \
+     "--model-store", "/home/model-server/model-store", \
+     "--ts-config", "/home/model-server/config.properties", \
+     "--foreground"]
